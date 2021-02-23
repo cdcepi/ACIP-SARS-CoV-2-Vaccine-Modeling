@@ -1,0 +1,364 @@
+---
+title: "COVID-19 at skilled nursing facilities"
+author: "Prabasaj Paul for the Mathematical Modeling Team, Epidemiology Taskforce, CDC COVID-19 Response"
+date: "`r format(Sys.time(), '%A %d %B %Y')`"
+output:
+  html_document:
+    code_folding: hide
+    number_sections: yes
+    toc: yes
+    toc_collapse: no
+    toc_depth: 2
+    toc_float: yes
+  pdf_document:
+    toc: yes
+    toc_depth: '2'
+  word_document:
+    toc: yes
+    toc_depth: '2'
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r load required packages and define helper functions, warning=FALSE, message=FALSE}
+# try(setwd(wd<-"C:\\Users\\prabasaj\\OneDrive - CDC\\corona"))
+# try(setwd(wd<-"C:\\Users\\vig5\\OneDrive - CDC\\corona"))
+options(stringsAsFactors=FALSE)
+# library(rio)
+library(deSolve)
+
+# source("vaccine/vaccine_module_frontmatter.R")
+
+# allvars = ls()
+# allstr = paste(paste(allvars, "=", allvars), collapse=",")
+# eval(parse(text = paste("allvars = list(", allstr, ")")))
+# saveRDS(allvars, "vaccine/SNF_self_contained/SNF_allvars.rds")
+
+allvars = readRDS("vaccine/SNF_self_contained/SNF_allvars.rds")
+for (vv in names(allvars)) eval(parse(text = paste0(vv, "=", "allvars$", vv)))
+
+SNF_SEIR = function(Time, State, Pars) { # Pars includes polymod for HCW-community interactions
+  # State is 4N-element vector for total SNF population
+  # Community solution supplied in pars$out_state (days X N X 4 array)
+  # HCW to community transmission is assumed negligible for community
+  # hcw_prop is N vector of proportion in age group at SNF that is HCW (elements 0 or 1)
+  # HCW are considered non-infectious if hcw_I_isol (HCW isolated when symptomatic)
+  # Residents are admitted and discharged at rate 1/LOS
+  # Admissions are at community prevalence, age-adjusted to residents
+  # NOTE: HCW absence (due to isolation) yet to be accounted for (by rescaling HCW numbers)
+  nr = nrow(Pars$polymod.SNF)
+  State = matrix(State, nrow=nr, dimnames=list(paste0("AGE", 1:nr), c("S", "E", "I", "R"))) 
+  State_hcw = Pars$hcw_prop * State
+  State_res = Pars$res_prop * State
+  hcw_weight = sum(State_hcw)
+  State_hcw = State_hcw/hcw_weight # Normalizing, for the community interaction portion
+  dState = State * 0
+  days = as.numeric(gsub("[[:alpha:] ]", "", dimnames(Pars$out_state)[[1]]))
+  Day = findInterval(Time, days, all.inside=TRUE)
+  State_com = Pars$out_state[Day,,]
+  State_com = matrix(State_com, nrow=nr, dimnames=list(paste0("AGE", 1:nr), c("S", "E", "I", "R")))
+  State_com_res = prop.table(State_com, 1) * pars_SNF$res_prop * pars_SNF$age_frac_SNF # Resident-age adjusted
+  dState[, "S"] = with(Pars, - (State[, "E"] %*% beta_SNF_E) * State[, "S"] - 
+                               (((1 - hcw_I_isol * hcw_prop * frac_symp) * State[, "I"]) %*% beta_SNF_I) * State[, "S"] -
+                               hcw_weight * (State_com[, "E"] %*% beta_com_E) * (State_hcw[, "S"]) -
+                               hcw_weight * (State_com[, "I"] %*% beta_com_I) * (State_hcw[, "S"]) +
+                               State_com_res[, "S"]/LOS - State_res[, "S"]/LOS )
+  dState[, "E"] = with(Pars, - dState[, "S"] + (State_com_res[, "S"]/LOS - State_res[, "S"]/LOS) -
+                               State[, "E"]/tau_E + State_com_res[, "E"]/LOS - State_res[, "E"]/LOS)
+  dState[, "I"] = with(Pars, State[, "E"]/tau_E - State[, "I"]/tau_I + State_com_res[, "I"]/LOS - State_res[, "I"]/LOS)
+  dState[, "R"] = with(Pars, State[, "I"]/tau_I + State_com_res[, "R"]/LOS - State_res[, "R"]/LOS)
+  list(dState) 
+}
+
+
+## End helper functions
+
+```
+
+# Overview
+
+
+
+
+
+```{r Set up SNF model}
+####################
+# SNF model
+# Community <--> HCW <--> Residents
+# Community prevalence (by age and versus time) is given as input
+# HCW interacts with community when not at work
+# HCW and Residents interact (including within each group) as SNF
+# Both age-structured. For now, each 5-year age band is either HCW or Resident or neither (but not both)
+# (More a hack to have the age-specific compartments do double duty as HCW/Resident compartments) 
+# Number of HCW is taken as total (on and off shift) using average daily HCW census (from PBJ hours) and shift-adjustment
+# HCW-HCW interaction assumed to follow polymod.work.US
+# Resident-resident interaction assumed to follow polymod.US
+# Resident-HCW interactions parametrized to daily contact rates
+# Using 4.5 non-physical + 3.4 physical HCW contacts per resident daily (estimated from Carline van den Dool et al, Table III, supllement)
+# Transmission prob per HCW-resident contact estimated as mean value in community (weight 4.5) and sqrt(0.045) * 0.15 (weight 3.4) (Braj/CRE) 
+# PPE use, etc can be implemented through res_hcw_transmission_prob_multiplier
+# HCW are considered non-infectious if hcw_I_isol (HCW isolate themselves when symptomatic
+# From PBJ 2017Q4-2018Q3: mean MDSCENSUS = 86.7, mean HRS = 325.5 = 13.6 * 24 (87 residents, 13 employees at any time)
+
+pars$vax_pars$eff2 = 0.5 # 2020-08-12 (for 18-64)
+pars$vax_pars$mult_65 = 0.6 # 2020-08-12 (multiplier for 65+) # Not implemented yet?
+
+# Initiate pars_SNF
+pars_SNF = pars
+
+## SNF population data
+# HCW age distribution (ACS 2014-2018 US)
+pars_SNF$shift_adj = 1/3 # HCW shift as fraction of a day
+HCW_age = read.csv("ACStable_B23001_10_2018_5_EmploymentAge.csv")
+temp = grep("[Mm]ale", HCW_age$VARIABLE)
+HCW_age = cbind(HCW_age[temp[1]:(temp[2]-1),], HCW_age[-(1:(temp[2]-1)),]) # Get the male and female numbers in adjacent columns
+HCW_age = HCW_age[grep("(years)|(Employed)", HCW_age[,1]),] # Total and employed, by age and sex
+HCW_age[, 2] = (HCW_age[, 2] + HCW_age[, 4])
+HCW_age = cbind(HCW_age[seq(1, nrow(HCW_age), by=2), 1], data.frame(t(matrix(HCW_age[,2], nrow=2))))
+names(HCW_age) = c("AGE", "TOTAL", "EMPLOYED")
+mat13to16 = rbind(rep(0,13), rep(0,13), rep(0,13), rep(0,13),
+                  c(0,1,1,rep(0, 10)), c(0,0,0,1,rep(0,9)), c(0,0,0,0,1,rep(0,8)), c(rep(0,5),0.5,rep(0,7)),
+                  c(rep(0,5),0.5,rep(0,7)), c(rep(0,6),0.5,rep(0,6)), c(rep(0,6),0.5,rep(0,6)), c(rep(0,7),1,rep(0,5)),
+                  c(rep(0,8),1,1,rep(0,3)), rep(0,13), rep(0,13), rep(0,13))
+FRAC_EMP = mat13to16%*%HCW_age$EMPLOYED/mat13to16%*%HCW_age$TOTAL
+FRAC_EMP[is.na(FRAC_EMP)] = 0
+pars_SNF$population_hcw = 13.6/pars_SNF$shift_adj * prop.table(c(mat13to16%*%HCW_age[,3]))
+pars_SNF$hcw_prop = c(0, 0, 0, 0, rep(1, 9), 0, 0, 0)
+
+# Resident age distribution (MDS 2017 summary)
+SNF_age = read.csv("snf_pop_by_age.csv")
+SNF_stays = read.csv("AGE_TABLE_2017.csv")
+pars_SNF$population_res = 
+  86.7 * prop.table(c(rep(0, 13), as.vector(tapply(SNF_age$MEAN_SNF_CENSUS, cut(SNF_age$AGE, c(64.5, 69.5, 74.5, Inf)), sum))))
+pars_SNF$res_prop = c(rep(0,13), 1, 1, 1)
+pars_SNF$LOS = with(subset(SNF_stays, AGE_YRS_20170701>=65), sum(PATIENT_DAYS)/sum(STAYS))
+
+pars_SNF$population_SNF = pars_SNF$population_res + pars_SNF$population_hcw
+pars_SNF$age_frac_SNF = prop.table(pars_SNF$population_SNF)
+## SNF population set in pars_snf
+```
+
+```{r Key parameters set and ODE solved here}
+## KEY PARAMETERS
+pars_SNF$res_hcw_contact_rate = 4.5 + 3.4 # Number of contacts daily with HCW for each resident; the big-unknown
+  # If >1, HCW-resident contacts more transmissive than everyday contacts
+pars_SNF$res_hcw_transmission_prob_multiplier = (4.5 + 3.4 * sqrt(0.045) * 0.15/pars_SNF$prob_trans_per_contact)/(4.5 + 3.4)
+pars_SNF$ipc_mult = 1 # <1 if IPC/PPE used to reduce HCW-resident transmission
+pars_SNF$hcw_I_isol = TRUE
+##
+
+## Set community scenario and trajectory into pars_SNF
+com_inp = list(target=0.01,
+               vax_day=as.Date("2020-09-01"),
+               pps="Phase II",
+               closure_duration=16, #weeks!
+               amp=0.3,
+               vax_scheme=1
+)
+com_run = vax_run(com_inp)
+pars_SNF$out_state = com_run$out_state_novax
+##
+
+## Set up polymods and betas
+pars_SNF$scenario = subset(social_distancing_scenarios, Scenario=="High intervention")
+# Community polymod is home + other (no school or work), for hcw when not at work
+temp_pars = within(pars_SNF, scenario$Value[scenario$Context %in% c("work", "school")] <- 0)
+temp_pars = scenario2beta(temp_pars)$Pars
+pars_SNF$beta_com_I = temp_pars$beta_I
+pars_SNF$beta_com_E = temp_pars$beta_E
+rm(temp_pars)
+
+## SNF polymod assembled here
+# First HCW-resident contacts
+# Resident and HCW proportion in each age bucket is assumed to be 0 or 1
+# Need to rethink if that has to be changed
+pars_SNF$polymod.res.hcw = with(pars_SNF, population_SNF * outer(res_hcw_contact_rate * res_prop, prop.table(population_hcw)))
+pars_SNF$polymod.res.hcw = with(pars_SNF, 
+  ipc_mult * res_hcw_transmission_prob_multiplier * (polymod.res.hcw + t(polymod.res.hcw)) * ifelse(population_SNF==0, 0, 1/population_SNF)
+)
+# Next HCW-HCW (work context) and res-res (home and other) contacts
+# Note: no teleworking for HCW-HCW interactions
+pars_SNF$scenario_SNF = list(work=1, home=0.2, other=1) 
+pars_SNF$polymod.SNF = with(pars_SNF,
+                         (scenario_SNF$home*polymod.home.US + scenario_SNF$other*polymod.other.US) * outer(res_prop, res_prop) + 
+                         scenario_SNF$work*polymod.work.US * outer(hcw_prop, hcw_prop) +
+                         polymod.res.hcw
+)
+polyscale.SNF = with(pars_SNF, t(t(polymod.SNF) * ifelse(age_frac_SNF==0, 0, 1/age_frac_SNF)) )
+pars_SNF$beta_SNF_I = with(pars_SNF, prob_trans_per_contact * polyscale.SNF)
+pars_SNF$beta_SNF_E = with(pars_SNF, inf_E_over_I * beta_SNF_I)
+##
+# Reproductive number estimates
+mm = pars_SNF$tau_E * pars_SNF$beta_SNF_E + pars_SNF$tau_I * pars_SNF$beta_SNF_I
+R0 = max(eigen(mm %*% diag(pars_SNF$age_frac_SNF))$values)
+              
+# Solve ODE after setting initial conditions and start and end days
+SNF.start.date = 1 # out_data$scenario.runs$peaks$target_dt[sr] # Somewhat arbitrary
+init_state_SNF = cbind(S=pars_SNF$age_frac_SNF, E=0, I=0, R=0) # Naive
+SNF.end.date = min(365, dim(pars_SNF$out_state)[1])
+SNF.days = SNF.start.date:SNF.end.date
+
+vax_doses_hcw = 0.01 * prop.table(pars_SNF$population_hcw)
+vax_doses_res = 0.01 * prop.table(pars_SNF$population_res) 
+pars_SNF$vaccinate = function(t, y, parms) { # Vaccination events$func
+  y = matrix(y, ncol=4)
+  dimnames(y)[[2]] = c("S","E","I","R")
+  vac_frac =  
+    parms$vax_pars$vax_doses * y[,"S"] * ifelse(t %in% (parms$vax_pars$vax_day + parms$vax_pars$t_d), parms$vax_pars$eff1, parms$vax_pars$eff2 - parms$vax_pars$eff1) /
+    (y[,"S"] + y[,"E"] + (!parms$vax_pars$sero_test) * (1-parms$frac_symp) * (y[,"I"] + y[,"R"])) 
+  vac_frac = pmin(vac_frac, y[,"S"], na.rm=TRUE) # Added na.rm to allow zero-population age groups
+  y[,"S"] = y[,"S"] - vac_frac
+  y[,"R"] = y[,"R"] + vac_frac
+  as.vector(y)
+}
+
+
+vax_outs = list()
+out_SNF = ode(SNF_SEIR, y = c(init_state_SNF), times = SNF.days, parms=pars_SNF)
+out_state_SNF = array(out_SNF[,-1], dim=c(nrow(out_SNF), dim(init_state_SNF)))
+dimnames(out_state_SNF) = list(time=paste("Day", out_SNF[,1]), age=dimnames(init_state_SNF)[[1]], state=dimnames(init_state_SNF)[[2]])
+vax_outs[[1]] = out_state_SNF
+
+# Alt 2020-11-28 additional benefit of vaccinating residents at a nursing home
+# SNF with 41 direct care staff, 87 residents
+# Scenarios: HCP uptake 0%, 50%, 70% 100%; resident uptake 0%, 70% 
+# Resident dose 1 to dose 2 attrition due to discharge 30%
+# Immunogenicity 7 days after dose; VE2 = 90%, VE1=VE2/4
+pars_SNF$vax_pars$vax_day = 1
+pars_SNF$vax_pars$eff2 = 0.9
+pars_SNF$vax_pars$eff1 = 0.9/4
+pars_SNF$vax_pars$t_d = 7
+pars_SNF$vax_pars$sero_test = FALSE
+res_dose12_attrition = 0.3 # 30% discharged between doses 1 & 2
+names(vax_outs) = "Baseline"
+for (hcw_uptake in c(0, 0.5, 0.7, 1)) for (res_uptake in c(0, 0.7)) {
+    # uptake * eff1 + uptake * (1-res_dose12_attrition) * (eff2 - eff1) = uptake_effective * eff2 implies:
+    res_uptake_multiplier = (1 - res_dose12_attrition) + res_dose12_attrition * pars_SNF$vax_pars$eff1/pars_SNF$vax_pars$eff2
+    vax_doses_hcw = hcw_uptake * pars_SNF$hcw_prop * pars_SNF$age_frac_SNF
+    vax_doses_res = res_uptake_multiplier * res_uptake * pars_SNF$res_prop * pars_SNF$age_frac_SNF
+    pars_SNF$vax_pars$vax_doses = vax_doses_hcw + vax_doses_res
+  event_days = pars_SNF$vax_pars$vax_day + pars_SNF$vax_pars$t_d + c(0, pars_SNF$vax_pars$t_12) # Event = immunogenicity achieved
+  event_days = intersect(event_days, SNF.days)
+  if (length(event_days) > 0) {
+    out_SNF = ode(SNF_SEIR, y = c(init_state_SNF), times = SNF.days, parms=pars_SNF, events=list(func=pars_SNF$vaccinate, time=event_days))
+  } else {
+    out_SNF = ode(SNF_SEIR, y = c(init_state_SNF), times = SNF.days, parms=pars_SNF)
+  }
+  out_state_SNF = array(out_SNF[,-1], dim=c(nrow(out_SNF), dim(init_state_SNF)))
+  dimnames(out_state_SNF) = list(time=paste("Day", out_SNF[,1]), age=dimnames(init_state_SNF)[[1]], state=dimnames(init_state_SNF)[[2]])
+  vax_outs[[length(vax_outs)+1]] = out_state_SNF
+  names(vax_outs)[length(vax_outs)] = paste("HCW", hcw_uptake, "RES", res_uptake)
+}
+transmissions_hcw_res = sum(pars_SNF$population_SNF)* rbind(HCW=pars_SNF$hcw_prop, RES=pars_SNF$res_prop) %*% sapply(vax_outs, function(os) colSums(os[,,"E"])/pars_SNF$tau_E)
+barplot(transmissions_hcw_res[,-2], beside=TRUE, legend=TRUE, ylim=c(0, 60))
+text(c(temp), c(transmissions_hcw_res[,-2])+2, round(transmissions_hcw_res[,-2]))
+# Alt 2020-11-28 end
+
+# Alt
+for (veff in c(0.3, 0.5, 0.7, 0.9)) for (vdose in list(vax_doses_hcw, vax_doses_res)) { # veff = 0.9 added 2020-11-28 
+  pars_SNF$vax_pars$vax_day = 1
+  pars_SNF$vax_pars$vax_doses = vdose
+  pars_SNF$vax_pars$eff2 = veff
+  pars_SNF$vax_pars$eff1 = veff/4
+  event_days = pars_SNF$vax_pars$vax_day + pars_SNF$vax_pars$t_d + c(0, pars_SNF$vax_pars$t_12) # Event = immunogenicity achieved
+  event_days = intersect(event_days, SNF.days)
+  if (length(event_days) > 0) {
+    out_SNF = ode(SNF_SEIR, y = c(init_state_SNF), times = SNF.days, parms=pars_SNF, events=list(func=pars_SNF$vaccinate, time=event_days))
+  } else {
+    out_SNF = ode(SNF_SEIR, y = c(init_state_SNF), times = SNF.days, parms=pars_SNF)
+  }
+  out_state_SNF = array(out_SNF[,-1], dim=c(nrow(out_SNF), dim(init_state_SNF)))
+  dimnames(out_state_SNF) = list(time=paste("Day", out_SNF[,1]), age=dimnames(init_state_SNF)[[1]], state=dimnames(init_state_SNF)[[2]])
+  vax_outs[[length(vax_outs)+1]] = out_state_SNF
+}
+
+# Alt end
+
+# Alt default
+for (vdate in c(42, 70, 98)) for (vdose in list(vax_doses_hcw, vax_doses_res)) {
+  pars_SNF$vax_pars$vax_day = vdate
+  pars_SNF$vax_pars$vax_doses = vdose
+  event_days = pars_SNF$vax_pars$vax_day + pars_SNF$vax_pars$t_d + c(0, pars_SNF$vax_pars$t_12) # Event = immunogenicity achieved
+  event_days = intersect(event_days, SNF.days)
+  if (length(event_days) > 0) {
+    out_SNF = ode(SNF_SEIR, y = c(init_state_SNF), times = SNF.days, parms=pars_SNF, events=list(func=pars_SNF$vaccinate, time=event_days))
+  } else {
+    out_SNF = ode(SNF_SEIR, y = c(init_state_SNF), times = SNF.days, parms=pars_SNF)
+  }
+  out_state_SNF = array(out_SNF[,-1], dim=c(nrow(out_SNF), dim(init_state_SNF)))
+  dimnames(out_state_SNF) = list(time=paste("Day", out_SNF[,1]), age=dimnames(init_state_SNF)[[1]], state=dimnames(init_state_SNF)[[2]])
+  vax_outs[[length(vax_outs)+1]] = out_state_SNF
+}
+# Alt default end
+
+transmissions_hcw_res = rbind(pars_SNF$hcw_prop, pars_SNF$res_prop) %*% sapply(vax_outs, function(os) colSums(os[,,"E"])/pars_SNF$tau_E)
+#  row=infected (hcw, res), col=vaccinated*vax date (hcw, res)
+inf_prev_per_course = (transmissions_hcw_res[,1] - transmissions_hcw_res[, -1])/sum(vax_doses_hcw)
+
+# Fatality estimate
+# 0.004 among hcw, 0.004 * 2.6*3*0.281/0.05 mong res
+inf_prev_per_course * 0.004 * c(1, 2.6*3*0.281/0.05)
+
+# Alt plot
+cc = inf_prev_per_course*1000
+dd = inf_prev_per_course * 0.004 * c(1, 2.6*3*0.281/0.05)*1000 # New multipliers? 
+ccdd = rbind(cc-dd,dd)
+ # August ACIP graph
+png("vaccine/SNF_marginal_benefit_barplot_ACIP_AUG.png", width=2000, height=1300, pointsize=36)
+ccdd = ccdd[, 1:6] # Drop veff=0.9 to get the August ACIP meeting graph
+temp = barplot(ccdd[c(3,1,4,2)[4:1][c(3,4,1,2)], c(1,3,5,2,4,6)[-1]], col=c("#FF0000FF", "#FFC00080", "#007D57FF", "#007D5780")[4:1][c(3,4,1,2)], border=NA, 
+  ylab="Infections and deaths prevented per 1,000 courses", names=paste("VE:", c("30%", "50%", "70%", "30%", "50%", "70%")[-1]),
+  space=c(0.2, 0.2, 0.2, 1, 0.2, 0.2)[-1])
+# text(temp, 50 + colSums(ccdd[c(3,1,4,2), c(1,3,5,2,4,6)[-1]]), round(colSums(ccdd[c(3,1,4,2)[4:1], c(1,3,5,2,4,6)[-1]])), xpd=TRUE)
+text(tapply(temp, c(1,1,1,2,2,2)[-1], mean), -250, c("HCP vaccinated", "Residents vaccinated"), xpd=TRUE, cex=1.1)
+legend("topright", rev(c("HCP deaths", "HCP non-fatal infections", "Resident deaths", "Resident non-fatal infections"))[4:1][c(3,4,1,2)],
+  fill=rev(c("#FF0000FF", "#FFC00080", "#007D57FF", "#007D5780"))[4:1][c(3,4,1,2)], bty="n", border=NA)
+dev.off()
+ # Updated with veff = 0.9 (2020-11-28)
+png("vaccine/SNF_marginal_benefit_barplot_ACIP_AUG_update_NOV.png", width=2000, height=1300, pointsize=36)
+ccdd = ccdd[, -(1:2)] # Drop veff=0.3
+temp = barplot(ccdd[c(3,1,4,2)[4:1][c(3,4,1,2)], c(1,3,5,2,4,6)[-1]], col=c("#FF0000FF", "#FFC00080", "#007D57FF", "#007D5780")[4:1][c(3,4,1,2)], border=NA, ylim=c(0, 2000),
+  ylab="Infections and deaths prevented per 1,000 courses", names=paste("VE:", c("50%", "70%", "90%", "50%", "70%", "90%")[-1]),
+  space=c(0.2, 0.2, 0.2, 1, 0.2, 0.2)[-1])
+# text(temp, 50 + colSums(ccdd[c(3,1,4,2), c(1,3,5,2,4,6)[-1]]), round(colSums(ccdd[c(3,1,4,2)[4:1], c(1,3,5,2,4,6)[-1]])), xpd=TRUE)
+text(tapply(temp, c(1,1,1,2,2,2)[-1], mean), -250, c("HCP vaccinated", "Residents vaccinated"), xpd=TRUE, cex=1.1)
+legend("topright", rev(c("HCP deaths", "HCP non-fatal infections", "Resident deaths", "Resident non-fatal infections"))[4:1][c(3,4,1,2)],
+  fill=rev(c("#FF0000FF", "#FFC00080", "#007D57FF", "#007D5780"))[4:1][c(3,4,1,2)], bty="n", border=NA)
+dev.off()
+# End alt plot
+
+out_state_SNF = vax_outs[[1]]
+
+# out_SNF = ode(SNF_SEIR, y = c(init_state_SNF), times = SNF.days, parms=pars_SNF)
+# out_state_SNF = array(out_SNF[,-1], dim=c(nrow(out_SNF), dim(init_state_SNF)))
+# dimnames(out_state_SNF) = list(time=paste("Day", out_SNF[,1]), age=dimnames(init_state_SNF)[[1]], state=dimnames(init_state_SNF)[[2]])
+
+png("vaccine/SNF_epicurve_ACIP_AUG.png", width=2000, height=1300, pointsize=42)
+plot(100*(out_state_SNF[,,"I"] %*% pars_SNF$hcw_prop)/sum(pars_SNF$hcw_prop*pars_SNF$age_frac_SNF), type="l",
+  xlab="Days into outbreak", ylab="Prevalence (%) of infection", xlim=c(0,240), col="#FFC000", lwd=5)
+lines(100*(out_state_SNF[,,"I"] %*% pars_SNF$res_prop)/sum(pars_SNF$res_prop*pars_SNF$age_frac_SNF), col="#007D57", lwd=5)
+lines(100*rowSums(pars_SNF$out_state[,,"I"]), col="grey50", lwd=5)
+legend("topright", c("HCP", "Residents", "Community"), lwd=5, bty="n", col=c("#FFC000", "#007D57", "grey50")) 
+dev.off()
+
+plot((out_state_SNF[,,"R"] %*% pars_SNF$hcw_prop)/sum(pars_SNF$hcw_prop*pars_SNF$age_frac_SNF),
+  ((out_state_SNF[,,"E"]+out_state_SNF[,,"I"]) %*% pars_SNF$hcw_prop)/sum(pars_SNF$hcw_prop*pars_SNF$age_frac_SNF),
+  xlab="Proportion recovered/immune", ylab="Proportion exposed/infected", xlim=0:1, ylim=0:1)
+points((out_state_SNF[,,"R"] %*% pars_SNF$res_prop)/sum(pars_SNF$res_prop*pars_SNF$age_frac_SNF),
+  ((out_state_SNF[,,"E"]+out_state_SNF[,,"I"]) %*% pars_SNF$res_prop)/sum(pars_SNF$res_prop*pars_SNF$age_frac_SNF),
+  col="red")
+abline(1, -1, col="grey")
+# Daily tie lines:
+for (tt in 1:365) {
+  lines(c((out_state_SNF[tt,,"R"] %*% pars_SNF$hcw_prop)/sum(pars_SNF$hcw_prop*pars_SNF$age_frac_SNF),
+     (out_state_SNF[tt,,"R"] %*% pars_SNF$res_prop)/sum(pars_SNF$res_prop*pars_SNF$age_frac_SNF)),
+    c(((out_state_SNF[tt,,"E"]+out_state_SNF[tt,,"I"]) %*% pars_SNF$hcw_prop)/sum(pars_SNF$hcw_prop*pars_SNF$age_frac_SNF),
+     ((out_state_SNF[tt,,"E"]+out_state_SNF[tt,,"I"]) %*% pars_SNF$res_prop)/sum(pars_SNF$res_prop*pars_SNF$age_frac_SNF)),
+    col="#0000FF20")
+}
+legend("topright", c("Healthcare staff", "Residents"), pch=1, bty="n", col=c("black", "red")) 
+
+
+```
